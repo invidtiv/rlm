@@ -319,6 +319,48 @@ def test_invalid_kernel_mode_rejected():
         IPythonREPL(kernel_mode="nonsense")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("bad", [0, -1, -0.5])
+def test_invalid_startup_timeout_rejected(bad):
+    with pytest.raises(ValueError, match="startup_timeout"):
+        IPythonREPL(kernel_mode="in_process", startup_timeout=bad)
+
+
+@pytest.mark.parametrize("bad", [0, -1, -0.5])
+def test_invalid_subcall_timeout_rejected(bad):
+    with pytest.raises(ValueError, match="subcall_timeout"):
+        IPythonREPL(kernel_mode="in_process", subcall_timeout=bad)
+
+
+def test_subcall_timeout_none_is_allowed():
+    """``None`` is the documented "no timeout" sentinel, distinct from 0."""
+    with IPythonREPL(kernel_mode="in_process", subcall_timeout=None) as repl:
+        assert repl.subcall_timeout is None
+
+
+def test_init_failure_preserves_original_exception_over_cleanup_error(monkeypatch):
+    """If ``setup`` fails *and* cleanup would also fail, ``__init__``
+    must surface the original cause, not the cleanup error."""
+
+    class _Boom(Exception):
+        pass
+
+    # Fail in ``_setup_in_process`` before any IPython state is created
+    # (so the test doesn't leave dangling atexit handlers behind).
+    def _broken_setup(self):
+        raise _Boom("original cause")
+
+    monkeypatch.setattr(IPythonREPL, "_setup_in_process", _broken_setup)
+
+    # Make cleanup itself raise too, so we can verify the original wins.
+    def _broken_cleanup(self):
+        raise RuntimeError("cleanup also failed")
+
+    monkeypatch.setattr(IPythonREPL, "cleanup", _broken_cleanup)
+
+    with pytest.raises(_Boom, match="original cause"):
+        IPythonREPL(kernel_mode="in_process")
+
+
 @BOTH_MODES
 def test_cleanup_is_idempotent(kernel_mode: str):
     repl = IPythonREPL(kernel_mode=kernel_mode)
@@ -670,6 +712,57 @@ def test_stale_final_var_not_misattributed_to_next_cell():
 
     assert r2.final_answer is None, (
         f"cell B must not inherit cell A's stale FINAL_VAR; got {r2.final_answer!r}"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Reentrant cell → execute_code (LM reaches parent via bound-method __self__)
+# -----------------------------------------------------------------------------
+
+
+def test_in_process_cell_cannot_reenter_via_scaffold_self():
+    """An in-process cell that traverses any scaffold bound method's
+    ``__self__`` to call ``execute_code`` on the parent must surface a
+    ``RuntimeError`` rather than silently corrupting the parent's
+    tracking state.
+
+    Subprocess mode is naturally immune: kernel-side scaffolds are
+    plain functions with no ``__self__`` referencing the parent.
+    """
+    with IPythonREPL(kernel_mode="in_process") as repl:
+        # ``rlm_query`` is a bound method; ``rlm_query.__self__`` is the
+        # parent REPL. Any other scaffold (llm_query, FINAL_VAR, ...)
+        # would work just as well as a reentry vector.
+        result = repl.execute_code("rlm_query.__self__.execute_code('print(\"inner\")')")
+    assert (
+        "RuntimeError" in result.stderr
+        or "Reentrant" in result.stderr
+        or "Reentrant" in result.stdout
+    ), result.stderr or result.stdout
+
+
+def test_in_process_scaffold_self_reentry_preserves_outer_state():
+    """If the LM tries to reenter and we raise, the *outer* cell's
+    bookkeeping (``_pending_llm_calls``, ``_last_final_answer``) must
+    still be intact when execution resumes after the caught error."""
+
+    fake = _FakeSubcall(responses=["A"])
+    with IPythonREPL(kernel_mode="in_process", subcall_fn=fake) as repl:
+        # Cell makes a real rlm_query, then attempts reentry. The reentry
+        # raises and is caught locally; the outer rlm_query call should
+        # still be reflected in ``rlm_calls``.
+        result = repl.execute_code(
+            "real = rlm_query('outer')\n"
+            "try:\n"
+            "    rlm_query.__self__.execute_code('inner')\n"
+            "except RuntimeError as e:\n"
+            "    print('caught:', type(e).__name__)\n"
+            "print('outer-result:', real)\n"
+        )
+    assert "caught: RuntimeError" in result.stdout
+    assert "outer-result: A" in result.stdout
+    assert len(result.rlm_calls) == 1, (
+        f"outer rlm_query must remain tracked; got {len(result.rlm_calls)}"
     )
 
 

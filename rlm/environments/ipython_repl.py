@@ -490,6 +490,18 @@ class IPythonREPL(NonIsolatedEnv):
           ``ipykernel`` and is fully isolated from the parent's
           namespace, cwd, and signals.
 
+    Subcall attribution caveat (subprocess mode):
+        Subcall completions and FINAL_VAR answers are tagged with the
+        ``cell_id`` that was active *at the moment the kernel issued the
+        request*. If a cell spawns long-lived kernel-side state (a
+        ``threading.Thread``, an ``asyncio.Task`` left running, a
+        background timer) that calls ``rlm_query`` after the spawning
+        cell has finished, those calls will be tagged with whatever cell
+        is active *at call time*, not the cell that spawned the worker.
+        Practically: avoid leaving background work running across cells,
+        or accept that its rlm_calls will be reported under a later
+        cell's ``REPLResult``.
+
     Args:
         lm_handler_address: (host, port) of the LM handler socket server.
         context_payload: Initial context to load as ``context``/``context_0``.
@@ -540,6 +552,17 @@ class IPythonREPL(NonIsolatedEnv):
             raise ValueError(
                 f"kernel_mode must be 'in_process' or 'subprocess', got {kernel_mode!r}"
             )
+        if startup_timeout <= 0:
+            raise ValueError(f"startup_timeout must be positive, got {startup_timeout!r}")
+        if subcall_timeout is not None and subcall_timeout <= 0:
+            # ``socket.settimeout(0)`` is non-blocking mode (every send/recv
+            # raises immediately) — almost certainly not what a caller
+            # asking for a "0s timeout" actually wants. ``None`` means
+            # "no timeout"; a positive number means "this many seconds".
+            raise ValueError(
+                f"subcall_timeout must be positive or None (got {subcall_timeout!r}); "
+                "use None to disable the timeout."
+            )
 
         super().__init__(
             persistent=persistent,
@@ -582,6 +605,19 @@ class IPythonREPL(NonIsolatedEnv):
         # (cross-thread broker reentry) or corrupt this cell's tracking
         # state (same-thread reentry).
         self._subcall_threads: set[int] = set()
+        # Tracks threads currently inside ``execute_code``. In ``in_process``
+        # mode the LM can reach this REPL via any scaffold bound method's
+        # ``__self__`` (e.g. ``rlm_query.__self__.execute_code(...)``); a
+        # cell that does so would re-enter on the same thread under the
+        # RLock and silently clobber its own ``_pending_llm_calls`` /
+        # ``_last_final_answer`` tracking. Catching same-thread reentry
+        # here turns that into a clear ``RuntimeError``. Subprocess mode
+        # is already shielded by process isolation: the kernel-side
+        # scaffold is plain functions with no ``__self__``.
+        self._executing_threads: set[int] = set()
+        # Single lock guarding both reentry-tracking sets. Touched only
+        # on ``execute_code`` enter/exit and inside ``_tracked_subcall``,
+        # so contention is negligible.
         self._subcall_threads_lock = threading.Lock()
         self._context_count: int = 0
         self._history_count: int = 0
@@ -619,7 +655,13 @@ class IPythonREPL(NonIsolatedEnv):
             if setup_code:
                 self.execute_code(setup_code)
         except BaseException:
-            self.cleanup()
+            # Suppress *cleanup* errors so they don't shadow the original
+            # cause. ``raise`` (with no arg) re-raises the real exception
+            # the user needs to see.
+            try:
+                self.cleanup()
+            except Exception:
+                pass
             raise
 
     # -------------------------------------------------------------------------
@@ -1086,16 +1128,27 @@ class IPythonREPL(NonIsolatedEnv):
     # -------------------------------------------------------------------------
 
     def execute_code(self, code: str) -> REPLResult:
-        # Reentry guard: if the caller's thread is currently inside this
-        # REPL's ``subcall_fn`` (in-process synchronously, or subprocess
-        # via the broker handler thread), calling ``execute_code`` would
-        # either deadlock the cell lock (cross-thread broker reentry) or
-        # silently corrupt the in-flight cell's tracking (same-thread
-        # in-process reentry). Fail fast with a clear message.
+        # Reentry guards:
+        #
+        #  1. ``cur in self._subcall_threads`` — the caller is currently
+        #     inside ``subcall_fn`` (in-process synchronously, or via the
+        #     subprocess broker handler thread). Calling ``execute_code``
+        #     would either deadlock the cell lock (cross-thread case) or
+        #     silently corrupt this cell's bookkeeping (same-thread).
+        #
+        #  2. ``cur in self._executing_threads`` — the caller is already
+        #     inside an ``execute_code`` invocation on this same REPL.
+        #     This is the path an LM-generated cell takes when it
+        #     traverses ``rlm_query.__self__.execute_code(...)`` (or any
+        #     scaffold bound method) to call back into the parent. The
+        #     RLock would let it reenter, but the inner call clears
+        #     ``_pending_llm_calls`` / resets ``_last_final_answer`` and
+        #     leaves the outer cell with a corrupt result.
         cur = threading.get_ident()
         with self._subcall_threads_lock:
-            is_reentrant = cur in self._subcall_threads
-        if is_reentrant:
+            in_subcall = cur in self._subcall_threads
+            already_executing = cur in self._executing_threads
+        if in_subcall:
             raise RuntimeError(
                 "Reentrant execute_code on the same instance from inside "
                 "subcall_fn is not supported — it would deadlock or "
@@ -1103,10 +1156,25 @@ class IPythonREPL(NonIsolatedEnv):
                 "spawn a child REPL (with its own lock) instead of "
                 "calling back into its parent."
             )
+        if already_executing:
+            raise RuntimeError(
+                "Reentrant execute_code on the same instance is not "
+                "supported. The currently-running cell appears to have "
+                "called execute_code on its own REPL (e.g. via "
+                "rlm_query.__self__.execute_code(...)) — that would "
+                "corrupt this cell's tracking state. Use a separate "
+                "REPL instance for nested execution."
+            )
 
-        if self.kernel_mode == "in_process":
-            return self._execute_in_process(code)
-        return self._execute_in_kernel(code, timeout=self.cell_timeout, drain_broker=True)
+        with self._subcall_threads_lock:
+            self._executing_threads.add(cur)
+        try:
+            if self.kernel_mode == "in_process":
+                return self._execute_in_process(code)
+            return self._execute_in_kernel(code, timeout=self.cell_timeout, drain_broker=True)
+        finally:
+            with self._subcall_threads_lock:
+                self._executing_threads.discard(cur)
 
     def _execute_in_process(self, code: str) -> REPLResult:
         start_time = time.perf_counter()
