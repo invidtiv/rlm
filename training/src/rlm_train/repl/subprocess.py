@@ -57,7 +57,7 @@ class SubprocessReplBackend(ReplBackend):
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         try:
             init = await asyncio.wait_for(self._read_line(), timeout=self._startup_timeout)
-        except asyncio.TimeoutError as e:
+        except TimeoutError as e:
             await self.stop()
             raise WorkerStartupError(
                 f"Worker did not produce init line in {self._startup_timeout}s; "
@@ -75,7 +75,7 @@ class SubprocessReplBackend(ReplBackend):
                 try:
                     await self._send({"id": "_shutdown", "type": "shutdown"})
                     await asyncio.wait_for(self._read_line(), timeout=2.0)
-                except (BrokenPipeError, ConnectionResetError, asyncio.TimeoutError, WorkerProtocolError):
+                except (TimeoutError, BrokenPipeError, ConnectionResetError, WorkerProtocolError):
                     pass
         finally:
             if self._proc.returncode is None:
@@ -85,7 +85,7 @@ class SubprocessReplBackend(ReplBackend):
                     pass
                 try:
                     await asyncio.wait_for(self._proc.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     self._proc.kill()
                     await self._proc.wait()
             if self._stderr_task and not self._stderr_task.done():
@@ -126,7 +126,7 @@ class SubprocessReplBackend(ReplBackend):
             await self._send(payload)
             try:
                 resp = await asyncio.wait_for(self._read_line(), timeout=self._request_timeout)
-            except asyncio.TimeoutError as e:
+            except TimeoutError as e:
                 await self._kill_worker()
                 raise WorkerProtocolError(
                     f"Request {payload.get('type')} exceeded parent watchdog "
@@ -147,7 +147,7 @@ class SubprocessReplBackend(ReplBackend):
             return
         try:
             await asyncio.wait_for(self._proc.wait(), timeout=2.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     async def _send(self, payload: dict[str, Any]) -> None:

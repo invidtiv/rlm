@@ -5,16 +5,17 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Union
+from typing import Any
 
 from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
 
-FakeQuery = Callable[[str, "Any"], Union[str, Awaitable[str]]]
-FakeQueryBatched = Callable[[list[str], "Any"], Union[list[str], Awaitable[list[str]]]]
+FakeQuery = Callable[[str, "Any"], str | Awaitable[str]]
+FakeQueryBatched = Callable[[list[str], "Any"], list[str] | Awaitable[list[str]]]
 
 
 @dataclass
@@ -178,7 +179,7 @@ class SubLLMProxy:
                 if not isinstance(responses, list) or len(responses) != len(prompts):
                     return web.json_response({"error": "fake_query_batched returned wrong shape"})
                 if handle.record_call is not None:
-                    for p, r in zip(prompts, responses):
+                    for p, r in zip(prompts, responses, strict=True):
                         try:
                             handle.record_call({"model": model, "prompt": p, "response": r})
                         except Exception:

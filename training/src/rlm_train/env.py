@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import verifiers as vf
 from verifiers.types import Messages, State
@@ -17,7 +18,6 @@ from rlm.utils.prompts import (
     build_rlm_system_prompt,
     build_user_prompt,
 )
-
 from rlm_train.proxy import ClientHandle, SubLLMProxy
 from rlm_train.repl.base import ExecResult, ReplBackend
 from rlm_train.repl.subprocess import SubprocessReplBackend
