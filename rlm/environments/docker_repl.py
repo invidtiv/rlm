@@ -505,7 +505,13 @@ class DockerREPL(NonIsolatedEnv):
                 "max_concurrent_subcalls": self.max_concurrent_subcalls,
             },
         )
-        self.proxy_server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        # Bind on all interfaces so the container can reach the proxy via
+        # host.docker.internal. On macOS/Docker Desktop loopback works, but on
+        # native Linux host.docker.internal resolves to the bridge gateway IP
+        # (e.g. 172.17.0.1), which cannot reach a server bound to 127.0.0.1 -
+        # the connection is refused. The port is an ephemeral, short-lived one
+        # serving only LM/RLM proxy calls for this env's container.
+        self.proxy_server = ThreadingHTTPServer(("0.0.0.0", 0), handler)
         self.proxy_server.daemon_threads = True
         # Store the address on the server so handlers read it live; this is what
         # makes update_handler_address work across persistent multi-turn calls.
